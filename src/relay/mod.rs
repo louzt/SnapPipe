@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use ed25519_dalek::SigningKey;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -63,26 +64,72 @@ pub enum RelayError {
 }
 
 /// Configuration for [`Relay::new`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayConfig {
     pub listen_addr: SocketAddr,
     pub trust: Arc<TrustStore>,
     pub rate_limiter: Arc<RateLimiter>,
     pub idle_timeout: Duration,
+    /// The relay's own long-term identity key. The verifying half is the
+    /// canonical "expected subject" for every inbound ticket — see
+    /// `Relay::signing_key`. Wrapped in `Arc` so the handshake layer can
+    /// borrow a reference on every connection without a copy.
+    pub signing_key: Arc<SigningKey>,
+}
+
+impl std::fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("trust", &"Arc<TrustStore>")
+            .field("rate_limiter", &"Arc<RateLimiter>")
+            .field("idle_timeout", &self.idle_timeout)
+            .field("signing_key", &"Arc<SigningKey>")
+            .finish()
+    }
 }
 
 impl RelayConfig {
+    /// Build a config with an explicit signing key. This is the canonical
+    /// constructor — production callers should always pass a real key so
+    /// `Relay::signing_key()` returns a meaningful expected subject for the
+    /// handshake layer.
     pub fn new(
         listen_addr: SocketAddr,
         trust: Arc<TrustStore>,
         rate_limiter: Arc<RateLimiter>,
+        signing_key: Arc<SigningKey>,
     ) -> Self {
         Self {
             listen_addr,
             trust,
             rate_limiter,
             idle_timeout: Duration::from_secs(30),
+            signing_key,
         }
+    }
+
+    /// Build a config using a freshly-generated ephemeral key. Convenient for
+    /// tests and for dev loops that don't yet have an operator-managed
+    /// identity file. Production paths should prefer [`RelayConfig::new`]
+    /// with a loaded key.
+    pub fn with_generated_key(
+        listen_addr: SocketAddr,
+        trust: Arc<TrustStore>,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self::new(
+            listen_addr,
+            trust,
+            rate_limiter,
+            Arc::new(crate::generate_signing_key()),
+        )
+    }
+
+    /// Override the idle timeout (builder pattern).
+    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 }
 
@@ -100,6 +147,16 @@ impl Relay {
 
     pub fn config(&self) -> &RelayConfig {
         &self.config
+    }
+
+    /// Return the relay's signing key. The verifying half is used by the
+    /// QUIC listener as the canonical `expected_subject` for inbound
+    /// handshakes — a ticket whose `claims.subject` doesn't match
+    /// `self.signing_key().verifying_key()` is rejected with
+    /// `HandshakeErrorKind::SubjectMismatch`. The signing half is reserved
+    /// for future use (e.g. relay-issued tickets).
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.config.signing_key
     }
 
     /// Look up the per-node rate limit override from the trust store and
@@ -347,7 +404,7 @@ mod tests {
     async fn untrusted_peer_is_rejected_without_forwarding() {
         let trust = Arc::new(TrustStore::new());
         let limiter = Arc::new(RateLimiter::new(100));
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap(), trust, limiter);
+        let config = RelayConfig::with_generated_key("127.0.0.1:0".parse().unwrap(), trust, limiter);
         let relay = Relay::new(config);
 
         let peer = node();
@@ -370,7 +427,7 @@ mod tests {
         let limiter = Arc::new(RateLimiter::new(100));
         let peer = node();
         trust.add(peer.clone(), "trusted", 100);
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap(), trust, limiter);
+        let config = RelayConfig::with_generated_key("127.0.0.1:0".parse().unwrap(), trust, limiter);
         let relay = Relay::new(config);
 
         let payload = b"hello, relay!".to_vec();
@@ -394,7 +451,7 @@ mod tests {
         let limiter = Arc::new(RateLimiter::new(1)); // 1 token total
         let peer = node();
         trust.add(peer.clone(), "trusted", 1);
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap(), trust, limiter);
+        let config = RelayConfig::with_generated_key("127.0.0.1:0".parse().unwrap(), trust, limiter);
         let relay = Relay::new(config);
 
         // Pump enough bytes to consume the bucket and trigger rate-limit.
@@ -453,8 +510,30 @@ mod tests {
         let trust = Arc::new(TrustStore::new());
         let limiter = Arc::new(RateLimiter::new(50));
         let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
-        let config = RelayConfig::new(addr, trust, limiter);
+        let config = RelayConfig::with_generated_key(addr, trust, limiter);
         assert_eq!(config.listen_addr.port(), 7777);
         assert_eq!(config.idle_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn relay_exposes_signing_key() {
+        // C-001: relay must expose its signing key so the QUIC listener can
+        // use it as the canonical expected_subject for inbound tickets.
+        let trust = Arc::new(TrustStore::new());
+        let limiter = Arc::new(RateLimiter::new(50));
+        let key = Arc::new(crate::generate_signing_key());
+        let expected_vk = key.verifying_key();
+        let config = RelayConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            trust,
+            limiter,
+            key,
+        );
+        let relay = Relay::new(config);
+        assert_eq!(
+            relay.signing_key().verifying_key().to_bytes(),
+            expected_vk.to_bytes(),
+            "Relay::signing_key() must return the configured key"
+        );
     }
 }

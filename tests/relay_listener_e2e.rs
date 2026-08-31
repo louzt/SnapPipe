@@ -18,7 +18,7 @@ use snappipe::trust::TrustStore;
 fn make_relay(listen_addr: SocketAddr) -> Relay {
     let trust = Arc::new(TrustStore::new());
     let limiter = Arc::new(RateLimiter::new(1000));
-    let config = RelayConfig::new(listen_addr, trust, limiter);
+    let config = RelayConfig::with_generated_key(listen_addr, trust, limiter);
     Relay::new(config)
 }
 

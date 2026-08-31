@@ -85,13 +85,13 @@ pub async fn run_listener(
 
         let peer_addr = conn.remote_address();
         let relay = Arc::clone(&relay);
-        let _stats = Arc::clone(&stats);
+        let stats = Arc::clone(&stats);
         let cancel = Arc::clone(&cancel);
 
         // Spawn an async task per connection so multiple connections are
         // processed concurrently without blocking the accept loop.
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn, relay, cancel).await {
+            if let Err(e) = handle_connection(conn, relay, stats, cancel).await {
                 eprintln!("connection task for {} ended with error: {}", peer_addr, e);
             }
         });
@@ -112,13 +112,17 @@ pub async fn run_listener(
 async fn handle_connection(
     conn: quinn::Connection,
     relay: Arc<crate::relay::Relay>,
+    stats: Arc<Mutex<crate::relay::RelayStats>>,
     cancel: Arc<Mutex<bool>>,
 ) -> Result<(), std::io::Error> {
     let started_at_unix = crate::now_unix_seconds() as f64;
 
-    // Open stream 0 for the SnapPipe ticket handshake.
-    // open_bi() is an async fn that returns Result<(SendStream, RecvStream), ConnectionError>.
-    let (send, recv) = match conn.open_bi().await {
+    // Accept the client's bidi stream 0 for the SnapPipe ticket handshake.
+    // The client opens a stream via `client_handshake`; the server must
+    // accept it here with `accept_bi()`. (Calling `open_bi()` here would
+    // pair two distinct streams and the handshake would hang forever on
+    // the server's `read_exact`.)
+    let (send, recv) = match conn.accept_bi().await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("failed to open handshake stream: {}", e);
@@ -127,23 +131,22 @@ async fn handle_connection(
     };
 
     // TrustStore implements TrustCheck; Arc<TrustStore> coerces to Arc<dyn TrustCheck>.
-    // The dummy key is a placeholder — the relay's signing key is not yet exposed
-    // via a public API. See the D3 PR for adding Relay::signing_key().
     let trust: Arc<dyn TrustCheck> = relay.config().trust.clone() as Arc<dyn TrustCheck>;
 
-    // Obtain the relay's signing key for expected_subject validation.
-    // The relay does not currently expose its signing key; we use a
-    // placeholder that accepts any subject for now.  A follow-up PR should
-    // add `Relay::signing_key()` so we can pass the real key here.
-    let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[0u8; ed25519_dalek::SECRET_KEY_LENGTH]);
-    let expected_subject = dummy_key.verifying_key();
+    // C-001 fix: use the relay's actual signing key as the canonical
+    // expected subject for inbound tickets. Previously a zeroed dummy key
+    // was used here, which meant a ticket with ANY subject could pass the
+    // subject check (and only the issuer signature was enforced). With
+    // the real key, a ticket whose `claims.subject` does not match the
+    // relay's identity is rejected with `HandshakeErrorKind::SubjectMismatch`.
+    let relay_verifying_key = relay.signing_key().verifying_key();
     let now = crate::now_unix_seconds();
 
     let handshake_result = server_handshake(
         send,
         recv,
-        &dummy_key.verifying_key(), // issuer_verifying_key — checked against ticket
-        &expected_subject,
+        &relay_verifying_key, // issuer_verifying_key — bound to relay identity
+        &relay_verifying_key, // expected_subject — must match claims.subject
         trust,
         now,
     )
@@ -175,13 +178,14 @@ async fn handle_connection(
         };
 
         let relay = Arc::clone(&relay);
+        let stats = Arc::clone(&stats);
         let started = started_at_unix;
         let node = peer_node.clone();
 
         // Each stream is handled in its own async task so byte-pumping on one
         // stream does not block others on the same connection.
         tokio::spawn(async move {
-            let _log = relay
+            let log = relay
                 .handle_connection(
                     node,
                     QuicRecvStream(recv),
@@ -190,6 +194,15 @@ async fn handle_connection(
                     || crate::now_unix_seconds() as f64,
                 )
                 .await;
+            // B-003: feed the resulting ConnectionLog into the shared
+            // RelayStats so the listener's final stats snapshot reflects
+            // every relayed stream outcome, not just handshake-level
+            // events. Without this, the `total()` field returned to the
+            // operator was always 0 even when streams had been processed.
+            if let Ok(log) = log {
+                let mut guard = stats.lock().await;
+                guard.record(&log);
+            }
         });
     }
 

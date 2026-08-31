@@ -28,6 +28,27 @@ use serde::Serialize;
 pub const DEFAULT_RATE_PER_MIN: u32 = 100;
 
 /// One token bucket sized in requests-per-minute.
+///
+/// **Floating-point caveat (B-006)**: `tokens`, `capacity` and
+/// `refill_per_sec` are stored as `f64` rather than integer counts so the
+/// refill calculation can express sub-second accrual correctly. This is a
+/// deliberate trade-off — three things to keep in mind:
+///
+/// 1. **Accumulation drift**: every `refill()` call adds
+///    `elapsed * refill_per_sec` (an f64 multiplication). Over very long
+///    quiet periods the bucket approaches but does not always equal
+///    `capacity` exactly (last few ULPs off). Tests that pin capacity to a
+///    specific value should compare with `assert_eq!` on freshly-created
+///    buckets and with `approx_eq`-style tolerance on buckets that have
+///    refilled.
+/// 2. **Negative tokens**: `refill()` clamps to `capacity` but
+///    `try_consume` decrements by `1.0` without re-clamping, so under
+///    pathological scheduling `tokens` could in theory drift a tiny amount
+///    below 0.0. `try_consume` guards against this with `tokens >= 1.0`.
+/// 3. **Re-tune semantics**: `retune()` updates `capacity` and
+///    `refill_per_sec` but does NOT preserve the existing `tokens` value
+///    precisely — it clamps to the new capacity, which is the desired
+///    behavior (don't grant more tokens than the new policy allows).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TokenBucket {
     pub tokens: f64,
