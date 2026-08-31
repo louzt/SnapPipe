@@ -127,22 +127,23 @@ async fn handle_connection(
     };
 
     // TrustStore implements TrustCheck; Arc<TrustStore> coerces to Arc<dyn TrustCheck>.
-    // The dummy key is a placeholder — the relay's signing key is not yet exposed
-    // via a public API. See the D3 PR for adding Relay::signing_key().
     let trust: Arc<dyn TrustCheck> = relay.config().trust.clone() as Arc<dyn TrustCheck>;
 
-    // Obtain the relay's signing key for expected_subject validation.
-    // The relay does not currently expose its signing key; we use a
-    // placeholder that accepts any subject for now.  A follow-up PR should
-    // add `Relay::signing_key()` so we can pass the real key here.
-    let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[0u8; ed25519_dalek::SECRET_KEY_LENGTH]);
-    let expected_subject = dummy_key.verifying_key();
+    // Use the relay's own long-term signing key as the issuer_verifying_key
+    // for ticket validation. This is the SAME key used by `issue_ticket`,
+    // so a ticket signed by THIS relay will validate. A trust-store lookup
+    // would let ANY trusted node act as issuer, which is wrong for the
+    // server-side handshake: we want to reject tickets issued by anyone
+    // other than ourselves (the relay). The trust store is consulted for
+    // the SUBJECT (peer node) downstream, not the issuer.
+    let relay_signing_key = relay.signing_key();
+    let expected_subject = relay_signing_key.verifying_key();
     let now = crate::now_unix_seconds();
 
     let handshake_result = server_handshake(
         send,
         recv,
-        &dummy_key.verifying_key(), // issuer_verifying_key — checked against ticket
+        &relay_signing_key.verifying_key(), // issuer_verifying_key — relay's own key
         &expected_subject,
         trust,
         now,

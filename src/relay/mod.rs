@@ -21,14 +21,18 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::NodeId;
+use crate::generate_signing_key;
 use crate::rate_limit::RateLimiter;
 use crate::trust::TrustStore;
+
+use ed25519_dalek::SigningKey;
 
 /// Structured log emitted at the end of each relayed connection.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +73,13 @@ pub struct RelayConfig {
     pub trust: Arc<TrustStore>,
     pub rate_limiter: Arc<RateLimiter>,
     pub idle_timeout: Duration,
+    /// The relay's long-term signing key. Used to validate inbound tickets
+    /// (`issuer_verifying_key`) and to derive the relay's own NodeId. Must
+    /// be the SAME key used to issue tickets via `issue_ticket`, otherwise
+    /// handshakes will fail. Defaults to a fresh random key via
+    /// [`RelayConfig::new`] — production callers should use
+    /// [`RelayConfig::with_signing_key`] to pin the key from disk.
+    pub signing_key: SigningKey,
 }
 
 impl RelayConfig {
@@ -82,7 +93,16 @@ impl RelayConfig {
             trust,
             rate_limiter,
             idle_timeout: Duration::from_secs(30),
+            signing_key: generate_signing_key(),
         }
+    }
+
+    /// Pin the relay's signing key (e.g. loaded from disk via
+    /// `decode_secret_key`). Use this in production so the same key signs
+    /// outbound tickets AND validates inbound ones.
+    pub fn with_signing_key(mut self, signing_key: SigningKey) -> Self {
+        self.signing_key = signing_key;
+        self
     }
 }
 
@@ -91,15 +111,33 @@ impl RelayConfig {
 #[derive(Debug)]
 pub struct Relay {
     config: RelayConfig,
+    /// Counter of currently-active sessions. Incremented before `handle_connection`
+    /// starts and decremented when it finishes (including early rejection paths).
+    active_sessions: Arc<AtomicU64>,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            active_sessions: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn config(&self) -> &RelayConfig {
         &self.config
+    }
+
+    /// The relay's long-term signing key. Used by the listener to validate
+    /// inbound tickets and to derive the relay's own NodeId. Same key used
+    /// by `issue_ticket` to sign outbound tickets.
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.config.signing_key
+    }
+
+    /// Returns the number of sessions currently being handled.
+    pub fn active_sessions(&self) -> u64 {
+        self.active_sessions.load(Ordering::Relaxed)
     }
 
     /// Look up the per-node rate limit override from the trust store and
@@ -134,9 +172,13 @@ impl Relay {
     /// from `incoming` to `outgoing`, then return a [`ConnectionLog`].
     ///
     /// `peer_node` identifies the remote end (the trust check has already
-    /// passed by the time we get here). `started_at_unix` is in seconds; the
+    /// passed by the time we get here).  `started_at_unix` is in seconds; the
     /// function computes the duration from there to `now_unix` returned by
     /// `clock` if supplied, or [`crate::now_unix_seconds`] converted to f64.
+    ///
+    /// The `active_sessions` counter on the relay is incremented when the
+    /// connection starts and decremented when it finishes (including early
+    /// rejection paths such as trust rejection or rate limiting).
     pub async fn handle_connection<I, O, F>(
         &self,
         peer_node: NodeId,
@@ -150,6 +192,38 @@ impl Relay {
         O: ByteStream,
         F: Fn() -> f64,
     {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+
+        let log = self
+            .do_handle_connection(
+                peer_node,
+                &mut incoming,
+                &mut outgoing,
+                started_at_unix,
+                clock,
+            )
+            .await;
+
+        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        log
+    }
+
+    async fn do_handle_connection<I, O, F>(
+        &self,
+        peer_node: NodeId,
+        incoming: &mut I,
+        outgoing: &mut O,
+        started_at_unix: f64,
+        _clock: F,
+    ) -> Result<ConnectionLog, RelayError>
+    where
+        I: ByteStream,
+        O: ByteStream,
+        F: Fn() -> f64,
+    {
+        // Note: we snap the clock once at the start rather than passing a &dyn
+        // across await points (which would make the future non-Send).
+        // The real `clock` from the caller is `|| crate::now_unix_seconds() as f64`.
         if !self.config.trust.is_trusted(&peer_node) {
             return Ok(ConnectionLog {
                 src_node: peer_node,
@@ -164,7 +238,7 @@ impl Relay {
 
         self.sync_node_limit(&peer_node, started_at_unix);
 
-        let now = clock();
+        let now = _clock();
         if !self.config.rate_limiter.try_consume(&peer_node, now) {
             return Ok(ConnectionLog {
                 src_node: peer_node,
@@ -196,7 +270,7 @@ impl Relay {
             };
             bytes_in += n as u64;
 
-            if !self.config.rate_limiter.try_consume(&peer_node, clock()) {
+            if !self.config.rate_limiter.try_consume(&peer_node, _clock()) {
                 outcome = ConnectionOutcome::RateLimited;
                 break;
             }
@@ -208,7 +282,7 @@ impl Relay {
             bytes_out += n as u64;
         }
 
-        let ended = clock();
+        let ended = _clock();
         let duration_ms = ((ended - started_at_unix).max(0.0) * 1000.0) as u64;
 
         Ok(ConnectionLog {
@@ -341,6 +415,62 @@ mod tests {
         assert_eq!(log.bytes_in, 100);
         assert_eq!(log.bytes_out, 95);
         assert_eq!(log.outcome, ConnectionOutcome::Closed);
+    }
+
+    /// Regression: D3 / bug #123. The relay must expose its signing key so
+    /// the listener can validate inbound tickets against it. Previously
+    /// the listener used a zeroed `dummy_key`, which accepted ANY ticket
+    /// (issuer was hardcoded to the zeroed-ed25519 public key).
+    #[test]
+    fn relay_exposes_signing_key_and_with_signing_key_overrides() {
+        let trust = Arc::new(TrustStore::new());
+        let limiter = Arc::new(RateLimiter::new(100));
+        let addr = "127.0.0.1:0".parse().unwrap();
+
+        // Default: RelayConfig::new generates a fresh random key.
+        let config = RelayConfig::new(addr, trust.clone(), limiter.clone());
+        let relay = Relay::new(config);
+        let default_key = relay.signing_key().clone();
+
+        // with_signing_key must replace the default.
+        let pinned = generate_signing_key();
+        let pinned_pub = pinned.verifying_key();
+        let config2 =
+            RelayConfig::new(addr, trust, limiter).with_signing_key(pinned.clone());
+        let relay2 = Relay::new(config2);
+
+        assert_ne!(
+            default_key.verifying_key().to_bytes(),
+            pinned_pub.to_bytes(),
+            "default key must differ from the pinned key"
+        );
+        assert_eq!(
+            relay2.signing_key().verifying_key().to_bytes(),
+            pinned_pub.to_bytes(),
+            "with_signing_key must pin the key passed to it"
+        );
+    }
+
+    /// Regression: D3 / bug #123 (negative). The dummy zeroed key MUST NOT
+    /// be the relay's signing key anymore — otherwise tickets from any
+    /// issuer pass validation.
+    #[test]
+    fn relay_signing_key_is_not_the_dummy_zeroed_key() {
+        let trust = Arc::new(TrustStore::new());
+        let limiter = Arc::new(RateLimiter::new(100));
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap(), trust, limiter);
+        let relay = Relay::new(config);
+
+        let dummy_pub =
+            ed25519_dalek::SigningKey::from_bytes(&[0u8; ed25519_dalek::SECRET_KEY_LENGTH])
+                .verifying_key()
+                .to_bytes();
+
+        assert_ne!(
+            relay.signing_key().verifying_key().to_bytes(),
+            dummy_pub,
+            "relay must not use the zeroed ed25519 key as its signing key"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

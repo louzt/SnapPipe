@@ -168,6 +168,47 @@ Each per-NodeId override is enforced by `RateLimiter::set_limit` with
 the documented zero-clamp (a misconfigured `set_limit(&id, 0, _)` is
 clamped to `DEFAULT_RATE_PER_MIN`, not silently disabled).
 
+## Layer 0: SnapPipe-gated QUIC
+
+The SnapPipe relay (`run_listener` in [`src/relay/listener.rs`](../src/relay/listener.rs))
+is the **Layer 0** in the 5-tier fallback stack: it runs on the VPS and
+accepts incoming QUIC connections from peers that have already completed
+a SnapPipe ticket handshake on stream 0.
+
+```mermaid
+flowchart LR
+    subgraph connectivity["CONNECTIVITY (ssh-proxy 5-tier)"]
+        T1[QUIC]
+        T2[Hysteria2]
+        T3[gost]
+        T4[tls-direct]
+        T5[direct-ssh]
+    end
+    L0[Layer 0<br/>SnapPipe relay<br/>run_listener]
+    APP[Application]
+
+    T1 --> T2 --> T3 --> T4 --> T5
+    T4 -.-> L0
+    L0 --> APP
+```
+
+**Order of operations** (per connection attempt):
+
+1. `ssh-proxy` races Tier 1 (QUIC) → Tier 2 (Hysteria2) → Tier 3 (gost) → Tier 4 (tls-direct) → Tier 5 (direct-ssh).
+2. On the VPS side, `run_listener` accepts the QUIC connection.
+3. Stream 0 performs `server_handshake` (ticket validation + trust check).
+4. If the handshake succeeds, streams 1…N are forwarded to the application.
+5. If the handshake fails (untrusted issuer, replay, expired ticket), the
+   connection is closed — the 5-tier chain degrades gracefully without
+   leaking sessions.
+
+**Cross-link to 5-tier chain**: The full 5-tier fallback chain (including the
+`tls-direct` bypass that resolves the `gost-client` lazy-deadlock) is
+documented in the operational case study:
+
+- **Gist**: [TLS-Direct Bypass of Lazy Proxy Deadlocks](https://gist.github.com/louzt/3991f144c7d67726045af3cefc60f42a)
+- **Gist (Spanish)**: [Bypass TLS-Direct de Deadlocks de Proxy Perezoso](https://gist.github.com/louzt/585c737dd9eb8a1986dacf41476a1a14)
+
 ## Compatibility
 
 | Component | Required version | Notes |
