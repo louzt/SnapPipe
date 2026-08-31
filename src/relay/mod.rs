@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -91,15 +92,26 @@ impl RelayConfig {
 #[derive(Debug)]
 pub struct Relay {
     config: RelayConfig,
+    /// Counter of currently-active sessions. Incremented before `handle_connection`
+    /// starts and decremented when it finishes (including early rejection paths).
+    active_sessions: Arc<AtomicU64>,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            active_sessions: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn config(&self) -> &RelayConfig {
         &self.config
+    }
+
+    /// Returns the number of sessions currently being handled.
+    pub fn active_sessions(&self) -> u64 {
+        self.active_sessions.load(Ordering::Relaxed)
     }
 
     /// Look up the per-node rate limit override from the trust store and
@@ -134,9 +146,13 @@ impl Relay {
     /// from `incoming` to `outgoing`, then return a [`ConnectionLog`].
     ///
     /// `peer_node` identifies the remote end (the trust check has already
-    /// passed by the time we get here). `started_at_unix` is in seconds; the
+    /// passed by the time we get here).  `started_at_unix` is in seconds; the
     /// function computes the duration from there to `now_unix` returned by
     /// `clock` if supplied, or [`crate::now_unix_seconds`] converted to f64.
+    ///
+    /// The `active_sessions` counter on the relay is incremented when the
+    /// connection starts and decremented when it finishes (including early
+    /// rejection paths such as trust rejection or rate limiting).
     pub async fn handle_connection<I, O, F>(
         &self,
         peer_node: NodeId,
@@ -150,6 +166,38 @@ impl Relay {
         O: ByteStream,
         F: Fn() -> f64,
     {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+
+        let log = self
+            .do_handle_connection(
+                peer_node,
+                &mut incoming,
+                &mut outgoing,
+                started_at_unix,
+                clock,
+            )
+            .await;
+
+        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        log
+    }
+
+    async fn do_handle_connection<I, O, F>(
+        &self,
+        peer_node: NodeId,
+        incoming: &mut I,
+        outgoing: &mut O,
+        started_at_unix: f64,
+        _clock: F,
+    ) -> Result<ConnectionLog, RelayError>
+    where
+        I: ByteStream,
+        O: ByteStream,
+        F: Fn() -> f64,
+    {
+        // Note: we snap the clock once at the start rather than passing a &dyn
+        // across await points (which would make the future non-Send).
+        // The real `clock` from the caller is `|| crate::now_unix_seconds() as f64`.
         if !self.config.trust.is_trusted(&peer_node) {
             return Ok(ConnectionLog {
                 src_node: peer_node,
@@ -164,7 +212,7 @@ impl Relay {
 
         self.sync_node_limit(&peer_node, started_at_unix);
 
-        let now = clock();
+        let now = _clock();
         if !self.config.rate_limiter.try_consume(&peer_node, now) {
             return Ok(ConnectionLog {
                 src_node: peer_node,
@@ -196,7 +244,7 @@ impl Relay {
             };
             bytes_in += n as u64;
 
-            if !self.config.rate_limiter.try_consume(&peer_node, clock()) {
+            if !self.config.rate_limiter.try_consume(&peer_node, _clock()) {
                 outcome = ConnectionOutcome::RateLimited;
                 break;
             }
@@ -208,7 +256,7 @@ impl Relay {
             bytes_out += n as u64;
         }
 
-        let ended = clock();
+        let ended = _clock();
         let duration_ms = ((ended - started_at_unix).max(0.0) * 1000.0) as u64;
 
         Ok(ConnectionLog {

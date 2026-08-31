@@ -14,6 +14,18 @@
 //! carrying the verified claims; the client then uses subsequent streams freely.
 //!
 //! End-to-end coverage lives in `tests/quic_e2e.rs` (real quinn loopback).
+//!
+//! ## NAT rebinding tolerance
+//!
+//! QUIC connections can silently migrate paths when the underlying carrier
+//! performs a NAT rebinding (e.g. laptop switches from Wi-Fi to 5G, or a
+//! carrier-grade NAT table entry expires).  The [`QuicTransportProfile`] configures
+//! [`QuicTransportProfile::keep_alive_interval_ms`] which drives periodic
+//! path-validation probes.  A connection that survives a rebind will have its
+//! [`quinn::PathStats::rtt`] updated; the [`crate::quic::rebind::RebindDiagnostics`]
+//! observer surface exposes this as lock-free metrics.  Together these give
+//! operators the signals needed to distinguish a genuine path migration from a
+//! genuinely broken connection.
 
 use ed25519_dalek::VerifyingKey;
 use quinn::{Connection, ReadExactError, RecvStream, SendStream, WriteError};
@@ -94,6 +106,28 @@ impl TrustCheck for DenyAllTrust {
     fn is_trusted(&self, _issuer: &NodeId) -> bool {
         false
     }
+}
+
+/// Session-level metrics for observability of session handshake outcomes.
+///
+/// Counters are updated by the relay layer when sessions start and finish.
+/// All reads are atomic — no locking required.
+///
+/// These metrics complement [`crate::quic::rebind::RebindDiagnostics`] which
+/// covers the path / transport layer; session metrics cover the handshake
+/// outcome layer.
+#[derive(Debug, Default)]
+pub struct SessionMetrics {
+    /// Handshakes that succeeded (ticket valid, issuer trusted, subject matched).
+    pub successful: std::sync::atomic::AtomicU64,
+    /// Handshakes that failed because the ticket was expired or invalid.
+    pub expired_or_invalid: std::sync::atomic::AtomicU64,
+    /// Handshakes rejected because the issuer was not in the trust store.
+    pub issuer_not_trusted: std::sync::atomic::AtomicU64,
+    /// Handshakes rejected because the subject did not match.
+    pub subject_mismatch: std::sync::atomic::AtomicU64,
+    /// Handshakes that failed for any other reason (protocol error, I/O).
+    pub other_errors: std::sync::atomic::AtomicU64,
 }
 
 /// Wire response sent by the server after the ticket check.

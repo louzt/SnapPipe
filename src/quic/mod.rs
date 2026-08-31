@@ -4,6 +4,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod endpoint;
+pub mod rebind;
 pub use endpoint::{
     DEFAULT_DEV_SAN, EndpointRole, QuicEndpointConfig, build_client_endpoint,
     build_server_endpoint, default_client_config, default_server_config, pinned_client_config,
